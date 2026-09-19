@@ -76,6 +76,20 @@ def _time_out_the_turn() -> None:
     raise TimeoutError("turn timed out")
 
 
+class _TurnFailed(Exception):
+    """A turn that dies inside the slot during the concurrent accounting run.
+
+    Distinct from the shared :func:`_fail_the_turn` ``RuntimeError`` so the
+    worker can catch its own expected failure without also catching
+    ``threading.BrokenBarrierError``, which subclasses ``RuntimeError``.
+    """
+
+
+def _fail_the_accounted_turn() -> None:
+    """Fail from a call rather than the ``with`` body (see :func:`_fail_the_turn`)."""
+    raise _TurnFailed("turn blew up")
+
+
 def test_a_held_slot_is_released_even_when_the_turn_raises() -> None:
     """The other half: a leaked permit is a process that answers 'at capacity' forever."""
     # Arrange
@@ -238,19 +252,23 @@ def test_overlapping_turns_return_every_slot_they_take() -> None:
     gate = _CountingGate(limit)
     start = threading.Barrier(turns)
     slot_is_full = threading.Barrier(limit)
-    unexpected: list[BaseException] = []
+    unexpected: list[Exception] = []
 
     def one_turn(index: int) -> None:
+        # ``_TurnFailed`` rather than the shared RuntimeError helper: a barrier
+        # that breaks raises ``threading.BrokenBarrierError``, which *is* a
+        # RuntimeError, so catching that here would swallow the one failure
+        # this test most needs to see.
         try:
             start.wait(timeout=10)
             try:
                 with queued_turn_slot(gate):
                     slot_is_full.wait(timeout=10)
                     if index % 3 == 0:
-                        _fail_the_turn()
-            except RuntimeError:
+                        _fail_the_accounted_turn()
+            except _TurnFailed:
                 pass
-        except BaseException as exc:  # noqa: BLE001 - reported as a test failure below
+        except Exception as exc:
             unexpected.append(exc)
 
     # daemon: a leaked permit parks its turn on ``acquire`` forever. Without

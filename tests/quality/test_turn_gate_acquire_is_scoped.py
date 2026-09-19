@@ -8,6 +8,11 @@ forever — no crash, no restart, just a task that looks healthy and busy.
 
 The behavior itself is pinned in ``tests/infrastructure/test_turn_capacity.py``;
 this guard stops a new caller from reintroducing the hand-rolled pairing.
+
+``try_acquire`` belongs to the :class:`TurnGate` protocol alone, so it is an
+offense wherever it is called — renaming the variable does not get a caller
+past this. ``acquire`` / ``release`` are shared with locks and semaphores, so
+those two count only on a gate-named receiver.
 """
 
 from __future__ import annotations
@@ -34,7 +39,15 @@ _PRODUCT_ROOTS = (
 #: The module that owns the two policies, and so owns the only acquire/release pair.
 _SLOTS_MODULE = Path("infrastructure/process/turn_capacity/slots.py")
 
-_PERMIT_METHODS = frozenset({"try_acquire", "acquire", "release"})
+#: Unique to the :class:`TurnGate` protocol, so a call is a gate call whatever
+#: the variable is called — an alias cannot hide behind a name lacking "gate".
+_GATE_ONLY_METHOD = "try_acquire"
+
+#: Shared with locks, semaphores and ``platform.release()``, so these count
+#: only on a receiver that names a gate. Matching them everywhere would flag
+#: unrelated code; the ``try_acquire`` rule above is what makes aliasing hard.
+_AMBIGUOUS_METHODS = frozenset({"acquire", "release"})
+_GATE_RECEIVER_TOKENS = ("gate", "permit", "slot")
 
 
 def _is_test_path(path: Path) -> bool:
@@ -42,19 +55,20 @@ def _is_test_path(path: Path) -> bool:
 
 
 def _gate_permit_calls(tree: ast.AST) -> list[tuple[int, str]]:
-    """Permit calls made on something named like a turn gate.
-
-    Keyed on the receiver rather than the method name: ``release`` alone is far
-    too common (locks, semaphores, ``platform.release()``) to flag on its own.
-    """
+    """Permit calls that take a turn slot outside the capacity policies."""
     hits: list[tuple[int, str]] = []
 
     class _Visitor(ast.NodeVisitor):
         def visit_Call(self, node: ast.Call) -> None:
             func = node.func
-            if isinstance(func, ast.Attribute) and func.attr in _PERMIT_METHODS:
+            if isinstance(func, ast.Attribute):
                 receiver = ast.unparse(func.value)
-                if "gate" in receiver.lower():
+                named_like_a_gate = any(
+                    token in receiver.lower() for token in _GATE_RECEIVER_TOKENS
+                )
+                if func.attr == _GATE_ONLY_METHOD or (
+                    func.attr in _AMBIGUOUS_METHODS and named_like_a_gate
+                ):
                     hits.append((node.lineno, f"{receiver}.{func.attr}()"))
             self.generic_visit(node)
 
